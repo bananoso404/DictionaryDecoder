@@ -52,9 +52,51 @@ public final class DictionaryDecoder {
 
 private extension DictionaryDecoder {
 
-    enum Error: Swift.Error {
-        case missingValue(at: [CodingKey])
-        case unexpectedValue(at: [CodingKey])
+    enum Error: Swift.Error, CustomDebugStringConvertible {
+        case missingKey(at: [CodingKey])
+        case missingValue(at: [CodingKey], expected: Any.Type)
+        case unexpectedValue(at: [CodingKey], expected: Any.Type, found: Any.Type)
+        
+        var debugDescription: String {
+            switch self {
+            case let .missingKey(path):
+                return "No value associated with key; Path \(self.pathString(path))"
+            case let .missingValue(path, expected):
+                return self.missingValueString(path, expected: expected)
+            case let .unexpectedValue(path, expected, found):
+                return self.unexpectedString(path: path, expected: expected, found: found)
+            }
+        }
+        
+        static func unexpected(_ path: [CodingKey], expected: Any.Type, found: Any) -> Error {
+            let foundMirror = Mirror(reflecting: found)
+            
+            return AnyOptional.isNil(by: foundMirror)
+                ? .missingValue(at: path, expected: expected)
+                : .unexpectedValue(at: path, expected: expected, found: foundMirror.subjectType)
+        }
+        
+        private func pathString(_ path: [CodingKey]) -> String {
+            let pathString = path.dropFirst().reduce(path.first?.stringValue ?? "") { result, key in result + ", " + key.stringValue }
+            
+            return "[" + (pathString.isEmpty ? "super" : pathString) + "]"
+        }
+        
+        private func unexpectedString(path: [CodingKey], expected: Any.Type, found: Any.Type) -> String {
+            let describingFound = String(describing: found)
+            let describingExpected = String(describing: expected)
+
+            let needReflection = describingFound == describingExpected
+            
+            let foundType = needReflection ? String(reflecting: found) : describingFound
+            let expectedType = needReflection ? String(reflecting: expected) : describingExpected
+
+            return "Expected to decode \(expectedType) but found a \(foundType) instead; Path \(self.pathString(path))"
+        }
+        
+        private func missingValueString(_ path: [CodingKey], expected: Any.Type) -> String {
+            return "Expected \(String(describing: expected)) value but found null instead; Path \(self.pathString(path))"
+        }
     }
 
     struct Decoder: Swift.Decoder {
@@ -70,8 +112,8 @@ private extension DictionaryDecoder {
         }
 
         func container<Key>(keyedBy type: Key.Type) throws -> KeyedDecodingContainer<Key> where Key: CodingKey {
-            guard let keyedStorage = storage.keyedStorage()  else {
-                throw Error.unexpectedValue(at: codingPath)
+            guard let keyedStorage = storage.keyedStorage() else {
+                throw Error.unexpected(codingPath, expected: [String: Any].self, found: self.storage.singleStorage)
             }
 
             let keyed = KeyedContainer<Key>(codingPath: codingPath,
@@ -82,7 +124,7 @@ private extension DictionaryDecoder {
 
         func unkeyedContainer() throws -> UnkeyedDecodingContainer {
             guard let unkeyedStorage = storage.unkeyedStorage()  else {
-                throw Error.unexpectedValue(at: codingPath)
+                throw Error.unexpected(codingPath, expected: [Any].self, found: self.storage.singleStorage)
             }
 
             return UnkeyedContainer(codingPath: codingPath,
@@ -141,23 +183,33 @@ private extension DictionaryDecoder {
         case none
         case some(Any)
 
-        init?(_ any: Any) {
-            guard Mirror(reflecting: any).displayStyle == .optional else {
-                return nil
-            }
-
-            if case Optional<Any>.some(let wrapped) = any {
-                self = .some(wrapped)
-            } else {
-                self = .none
-            }
-        }
-
         var isNone: Bool {
             switch self {
             case .none:
                 return true
             case .some(_):
+                return false
+            }
+        }
+        
+        init(_ any: Any) {
+            switch Mirror(reflecting: any).displayStyle {
+            case .optional:
+                if case Optional<Any>.some(let wrapped) = any {
+                    self = .some(wrapped)
+                } else {
+                    self = .none
+                }
+            default:
+                self = .some(any)
+            }
+        }
+
+        static func isNil(by mirror: Mirror) -> Bool {
+            switch mirror.displayStyle {
+            case .optional:
+                return mirror.children.isEmpty
+            default:
                 return false
             }
         }
@@ -210,17 +262,23 @@ extension DictionaryDecoder {
         }
 
         func getValue<T>(for key: Key) throws -> T {
-            guard let value = storage[key.stringValue] as? T else {
-                let path = codingPath.appending(key: key)
-                throw Error.unexpectedValue(at: path)
+            let path = codingPath.appending(key: key)
+            
+            guard let any = storage[key.stringValue] else {
+                throw Error.missingKey(at: path)
             }
+            
+            guard let value = any as? T else {
+                throw Error.unexpected(path, expected: T.self, found: any)
+            }
+            
             return value
         }
 
         private func getStorage(for key: Key) throws -> Decoder.Storage {
             guard let value = storage[key.stringValue] else {
                 let path = codingPath.appending(key: key)
-                throw Error.missingValue(at: path)
+                throw Error.missingKey(at: path)
             }
 
             if let keyedValue = value as? [String: Any] {
@@ -237,16 +295,11 @@ extension DictionaryDecoder {
 
         func decodeNil(forKey key: Key) throws -> Bool {
             let path = codingPath.appending(key: key)
-            guard
-                let value = storage[key.stringValue] else {
-                throw Error.missingValue(at: path)
+            guard let value = storage[key.stringValue] else {
+                throw Error.missingKey(at: path)
             }
 
-            guard let optional = AnyOptional(value) else {
-                throw Error.unexpectedValue(at: path)
-            }
-
-            return optional.isNone
+            return AnyOptional(value).isNone
         }
 
         func decode(_ type: Bool.Type, forKey key: Key) throws -> Bool {
@@ -371,11 +424,9 @@ extension DictionaryDecoder {
         private(set) var currentIndex: Int = 0
 
         mutating func getValue<T>() throws -> T {
-            guard
-                isAtEnd == false,
-                let value = storage[currentIndex] as? T else {
-                    let path = codingPath.appending(index: currentIndex)
-                    throw Error.unexpectedValue(at: path)
+            guard isAtEnd == false, let value = storage[currentIndex] as? T else {
+                let path = codingPath.appending(index: currentIndex)
+                throw Error.unexpected(path, expected: T.self, found: storage[currentIndex])
             }
 
             currentIndex += 1
@@ -396,12 +447,7 @@ extension DictionaryDecoder {
         mutating func decodeNil() throws -> Bool {
             let value = try getValue() as Any
 
-            guard let optional = AnyOptional(value) else {
-                let path = codingPath.appending(index: currentIndex)
-                throw Error.unexpectedValue(at: path)
-            }
-
-            return optional.isNone
+            return AnyOptional(value).isNone
         }
 
         mutating func decode(_ type: Bool.Type) throws -> Bool {
@@ -516,13 +562,12 @@ extension DictionaryDecoder {
         }
 
         func decodeNil() -> Bool {
-            let optional = AnyOptional(value)
-            return optional?.isNone == true
+            return AnyOptional(value).isNone
         }
 
         func getValue<T>() throws -> T {
             guard let value = self.value as? T else {
-                throw Error.unexpectedValue(at: codingPath)
+                throw Error.unexpected(codingPath, expected: T.self, found: self.value)
             }
             return value
         }
